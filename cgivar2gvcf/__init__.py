@@ -4,35 +4,19 @@
 from __future__ import unicode_literals
 import argparse
 import bz2
-from collections import OrderedDict
 import datetime
 import gzip
 import os
 import re
 import sys
 
-import twobitreader
-from twobitreader import download as twobitdownload
-
-
-VCF_DATA_TEMPLATE = OrderedDict([
-    ('CHROM', None),
-    ('POS', None),
-    ('ID', '.'),
-    ('REF', None),
-    ('ALT', '.'),
-    ('QUAL', '.'),
-    ('FILTER', '.'),
-    ('INFO', '.'),
-    ('FORMAT', '.'),
-    ('SAMPLE', '.')
-])
+from twobitreader import TwoBitFile, download as twobitdownload
 
 FILEDATE = datetime.datetime.now()
 
 
 def make_header(reference):
-    header = """##fileformat=VCFv4.1
+    return """##fileformat=VCFv4.1
 ##fileDate={}{}{}
 ##source=cgivar2gvcf-version-0.1.6
 ##description="Produced from a Complete Genomics var file using cgivar2gvcf. Not intended for clinical use."
@@ -42,26 +26,30 @@ def make_header(reference):
 ##FILTER=<ID=AMBIGUOUS,Description="Some or all of this sequence call marked as ambiguous by Complete Genomics">
 ##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
 ##INFO=<ID=END,Number=1,Type=Integer,Description="Stop position of the interval">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE
 """.format(FILEDATE.year, FILEDATE.month, FILEDATE.day, reference)
-    header = header + ("#" + '\t'.join([k for k in VCF_DATA_TEMPLATE]))
-    return header
 
 
+# @profile
 def auto_zip_open(filepath, mode):
     """Convenience function for opening potentially-compressed files."""
     if filepath.endswith('.gz'):
-        outfile = gzip.open(filepath, mode)
-    elif filepath.endswith('.bz2'):
-        outfile = bz2.BZ2File(filepath, mode)
-    else:
-        outfile = open(filepath, mode)
-    return outfile
+        return gzip.open(filepath, mode)
+
+    if filepath.endswith('.bz2'):
+        return bz2.BZ2File(filepath, mode)
+
+    return open(filepath, mode)
 
 
-def formatted_vcf_line(vcf_data):
-    return '\t'.join([vcf_data[k] for k in vcf_data])
+# @profile
+def formatted_vcf_line(chrom, pos, ref, id='.', alt='.', qual='.', filter='.',
+                       info='.', format='.', sample='.'):
+    return '\t'.join([chrom, pos, id, ref, alt, qual, filter, info, format,
+                      sample])
 
 
+# @profile
 def process_full_position(data, header, var_only=False):
     """
     Return genetic data when all alleles called on same line.
@@ -74,22 +62,23 @@ def process_full_position(data, header, var_only=False):
         (array of strings) the genome's allele sequences
     """
     feature_type = data[header['varType']]
+
     # Skip unmatchable, uncovered, or pseudoautosomal-in-X
-    if (feature_type == 'no-ref' or feature_type.startswith('PAR-called-in-X')):
+    if feature_type == 'no-ref' or feature_type.startswith('PAR-called-in-X'):
         return None
+
     if var_only and feature_type in ['no-call', 'ref']:
         return None
 
     filters = []
+
     if feature_type == 'no-call':
         filters.append('NOCALL')
-    if 'varQuality' in header:
-        if 'VQLOW' in data[header['varQuality']]:
-            filters.append('VQLOW')
-    else:
-        var_filter = data[header['varFilter']]
-        if var_filter and not var_filter == "PASS":
-            filters = filters + var_filter.split(';')
+
+    if 'varQuality' in header and 'VQLOW' in data[header['varQuality']]:
+        filters.append('VQLOW')
+    elif 'varFilter' in header and data[header['varFilter']] != 'PASS':
+        filters += data[header['varFilter']].split(';')
 
     chrom = data[header['chromosome']]
     start = data[header['begin']]
@@ -97,7 +86,9 @@ def process_full_position(data, header, var_only=False):
     alleles = [data[header['alleleSeq']]]
     dbsnp_data = []
     dbsnp_data = data[header['xRef']].split(';')
+
     assert data[header['ploidy']] in ['1', '2']
+
     if feature_type == 'ref' or feature_type == 'no-call':
         return [{'chrom': chrom,
                  'start': start,
@@ -117,7 +108,8 @@ def process_full_position(data, header, var_only=False):
                  'filters': filters}]
 
 
-def process_allele(allele_data, dbsnp_data, header, reference):
+# @profile
+def process_allele(allele_data, dbsnp_data, header):
     """Combine data from multiple lines refering to a single allele.
 
     Returns three items in this order:
@@ -130,31 +122,35 @@ def process_allele(allele_data, dbsnp_data, header, reference):
     var_allele = ''
     ref_allele = ''
     filters = []
+
     for data in allele_data:
-        if 'varQuality' in header:
-            if 'VQLOW' in data[header['varQuality']]:
-                filters.append('VQLOW')
-        else:
-            var_filter = data[header['varFilter']]
-            if var_filter and not var_filter == "PASS":
-                filters = filters + var_filter.split(';')
+        if 'varQuality' in header and 'VQLOW' in data[header['varQuality']]:
+            filters.append('VQLOW')
+        elif 'varFilter' in header and data[header['varFilter']] != 'PASS':
+            filters += data[header['varFilter']].split(';')
+
         if data[header['varType']] == 'no-call':
             filters = ['NOCALL']
             ref_allele = ref_allele + data[header['reference']]
             continue
+
         var_allele = var_allele + data[header['alleleSeq']]
         ref_allele = ref_allele + data[header['reference']]
+
         if data[header['xRef']]:
             for dbsnp_item in data[header['xRef']].split(';'):
                 dbsnp_data.append(dbsnp_item.split(':')[1])
+
     # It's theoretically possible to break up a partial no-call allele into
     # separated gVCF lines, but it's hard. Treat the whole allele as no-call.
     if 'NOCALL' in filters:
         filters = ['NOCALL']
         var_allele = '?'
+
     return var_allele, ref_allele, start, filters
 
 
+# @profile
 def get_split_pos_lines(data, cgi_input, header):
     """Advance across split alleles and return data from each.
 
@@ -165,16 +161,20 @@ def get_split_pos_lines(data, cgi_input, header):
     """
     s1_data = [data]
     s2_data = []
-    next_data = cgi_input.readline().decode('utf-8').rstrip('\n').split("\t")
-    while next_data[header['allele']] == "1":
+    next_data = cgi_input.readline().decode('utf-8').rstrip('\n').split('\t')
+
+    while next_data[header['allele']] == '1':
         s1_data.append(next_data)
-        next_data = cgi_input.readline().decode('utf-8').rstrip('\n').split("\t")
-    while next_data[header['allele']] == "2":
+        next_data = cgi_input.readline().decode('utf-8').rstrip('\n').split('\t')
+
+    while next_data[header['allele']] == '2':
         s2_data.append(next_data)
-        next_data = cgi_input.readline().decode('utf-8').rstrip('\n').split("\t")
+        next_data = cgi_input.readline().decode('utf-8').rstrip('\n').split('\t')
+
     return s1_data, s2_data, next_data
 
 
+# @profile
 def process_split_position(data, cgi_input, header, reference, var_only=False):
     """Process CGI var where alleles are reported separately.
 
@@ -191,7 +191,8 @@ def process_split_position(data, cgi_input, header, reference, var_only=False):
         (string) reference allele sequence
         (array of strings) the genome's allele sequences
     """
-    assert data[2] == "1"
+    assert data[2] == '1'
+
     chrom = data[header['chromosome']]
 
     # Get all lines for each allele. Note that this means we'll end up with
@@ -204,10 +205,10 @@ def process_split_position(data, cgi_input, header, reference, var_only=False):
     dbsnp_data = []
     a1_seq, ref_seq, start, a1_filters = process_allele(
         allele_data=s1_data, dbsnp_data=dbsnp_data,
-        header=header, reference=reference)
+        header=header)
     a2_seq, r2_seq, a2_start, a2_filters = process_allele(
         allele_data=s2_data, dbsnp_data=dbsnp_data,
-        header=header, reference=reference)
+        header=header)
     # clean dbsnp data
     dbsnp_data = [x for x in dbsnp_data if x]
     if (a1_seq or ref_seq) and (a2_seq or r2_seq):
@@ -226,29 +227,32 @@ def process_split_position(data, cgi_input, header, reference, var_only=False):
             # Handle edge case: because we create full no-calls from partial
             # no-call alleles, we may end up with a full no-call region.
             end = str(int(start) + len(ref_seq))
+
             yield {'chrom': chrom,
-                    'start': start,
-                    'dbsnp_data': [],
-                    'ref_seq': '=',
-                    'alleles': ['?'],
-                    'allele_count': '2',
-                    'filters': ['NOCALL'],
-                    'end': end}
+                   'start': start,
+                   'dbsnp_data': [],
+                   'ref_seq': '=',
+                   'alleles': ['?'],
+                   'allele_count': '2',
+                   'filters': ['NOCALL'],
+                   'end': end}
 
     # Handle the remaining line. Could recursively call this function if it's
     # the start of a new split position - very unlikely, though.
-    if next_data[2] == "all" or next_data[1] == "1":
+    if next_data[2] == 'all' or next_data[1] == '1':
         out = process_full_position(
             data=next_data, header=header, var_only=var_only)
     else:
         out = process_split_position(
             data=next_data, cgi_input=cgi_input, header=header,
             reference=reference, var_only=var_only)
+
     if out:
         for entry in out:
             yield entry
 
 
+# @profile
 def vcf_line(input_data, reference):
     """
     Convert the var files information into VCF format.
@@ -260,7 +264,6 @@ def vcf_line(input_data, reference):
     The returned line is a very simple, VCF-valid row containing the
     genome's data for this position.
     """
-    vcf_data = VCF_DATA_TEMPLATE.copy()
     start = int(input_data['start'])
     dbsnp_data = input_data['dbsnp_data']
     ref_allele = input_data['ref_seq']
@@ -271,8 +274,10 @@ def vcf_line(input_data, reference):
     for dbsnp in dbsnp_data:
         if dbsnp not in dbsnp_cleaned:
             dbsnp_cleaned.append(dbsnp)
+
     if dbsnp_cleaned:
         id_field = ';'.join(dbsnp_cleaned)
+
         if id_field == '':
             id_field = '.'
     else:
@@ -281,35 +286,42 @@ def vcf_line(input_data, reference):
     # Is this a matching reference line? Handle per gVCF spec.
     if input_data['ref_seq'] == '=':
         ref_allele = reference[input_data['chrom']][start].upper()
-        vcf_data['CHROM'] = input_data['chrom']
 
-        # Position notes: Complete Genomics uses 0-based start and 1-based end.
-        # Reference seq retrieval is 0-based start, but VCF is 1-based start.
-        vcf_data['POS'] = str(start + 1)
-        vcf_data['ID'] = id_field
-        vcf_data['REF'] = ref_allele
-        vcf_data['ALT'] = '.'
-        vcf_data['FORMAT'] = 'GT'
+        sample = '.'
+        filter = '.'
+        info = '.'
+
         assert input_data['allele_count'] in ['1', '2']
+
         if '?' in input_data['alleles']:
             if 'NOCALL' not in input_data['filters']:
                 input_data['filters'].append('NOCALL')
+
             if input_data['allele_count'] == '2':
-                vcf_data['SAMPLE'] = './.'
-            else:
-                vcf_data['SAMPLE'] = '.'
+                sample = './.'
         elif input_data['allele_count'] == '2':
-            vcf_data['SAMPLE'] = '0/0'
+            sample = '0/0'
         else:
-            vcf_data['SAMPLE'] = '0'
+            sample = '0'
 
         if input_data['filters']:
-            vcf_data['FILTER'] = ';'.join(input_data['filters'])
+            filter = ';'.join(input_data['filters'])
         else:
-            vcf_data['FILTER'] = 'PASS'
-        vcf_data['INFO'] = 'END={}'.format(input_data['end'])
+            filter = 'PASS'
 
-        return formatted_vcf_line(vcf_data)
+        info = 'END={}'.format(input_data['end'])
+
+        # Position notes: Complete Genomics uses 0-based start and 1-based end.
+        # Reference seq retrieval is 0-based start, but VCF is 1-based start.
+        return formatted_vcf_line(chrom=input_data['chrom'],
+                                  pos=str(start + 1),
+                                  id=id_field,
+                                  ref=ref_allele,
+                                  alt='.',
+                                  format='GT',
+                                  sample=sample,
+                                  filter=filter,
+                                  info=info)
 
     # VCF doesn't allow zero-length sequences. If we have this situation,
     # move the start backwards by one position, get that reference base,
@@ -323,8 +335,9 @@ def vcf_line(input_data, reference):
 
     # Figure out what our alternate alleles are.
     alt_alleles = []
+
     for allele in genome_alleles:
-        if allele not in [ref_allele] + alt_alleles and allele != '?':
+        if allele != '?' and allele not in [ref_allele] + alt_alleles:
             alt_alleles.append(allele)
 
     # Combine ref and alt for the full set of alleles, used for indexing.
@@ -333,25 +346,27 @@ def vcf_line(input_data, reference):
     # Get the indexed genotype.
     allele_indexes = [str(alleles.index(x)) for x in genome_alleles if
                       x != '?']
+
     [allele_indexes.append('.') for x in genome_alleles if x == '?']
+
     genotype = '/'.join(allele_indexes)
 
-    vcf_data['CHROM'] = input_data['chrom']
-    vcf_data['POS'] = str(start + 1)
-    vcf_data['ID'] = id_field
-    vcf_data['REF'] = ref_allele
-    vcf_data['ALT'] = ','.join(alt_alleles)
-    vcf_data['FORMAT'] = 'GT'
-    vcf_data['SAMPLE'] = genotype
+    filter = 'PASS'
 
     if input_data['filters']:
-        vcf_data['FILTER'] = ';'.join(sorted(input_data['filters']))
-    else:
-        vcf_data['FILTER'] = 'PASS'
+        filter = ';'.join(sorted(input_data['filters']))
 
-    return formatted_vcf_line(vcf_data)
+    return formatted_vcf_line(chrom=input_data['chrom'],
+                              pos=str(start + 1),
+                              id=id_field,
+                              ref=ref_allele,
+                              alt=','.join(alt_alleles),
+                              format='GT',
+                              sample=genotype,
+                              filter=filter)
 
 
+# @profile
 def process_next_position(data, cgi_input, header, reference, var_only):
     """
     Determine appropriate processing to get data, then convert it to VCF
@@ -371,16 +386,18 @@ def process_next_position(data, cgi_input, header, reference, var_only):
     So the returned line formats are consistent, process_next_position
     returns an array, even if there's only one line.
     """
-    if data[2] == "all" or data[1] == "1":
+    if data[2] == 'all' or data[1] == '1':
         # The output from process_full_position is an array, so it can be
         # treated in the same manner as process_split_position output.
-        out = process_full_position(data=data, header=header, var_only=var_only)
+        out = process_full_position(data=data, header=header,
+                                    var_only=var_only)
     else:
-        assert data[2] == "1"
+        assert data[2] == '1'
         # The output from process_split_position is a generator, and may end
         # up calling itself recursively.
         out = process_split_position(
-            data=data, cgi_input=cgi_input, header=header, reference=reference, var_only=var_only)
+            data=data, cgi_input=cgi_input, header=header, reference=reference,
+            var_only=var_only)
     if out:
 
         # ChrM is skipped because Complete Genomics is using a different
@@ -394,6 +411,7 @@ def process_next_position(data, cgi_input, header, reference, var_only):
                 l['chrom'] != 'chrM']
 
 
+# @profile
 def convert(cgi_input, twobit_ref, twobit_name, var_only=False):
     """Generator that converts CGI var data to VCF-formated strings"""
 
@@ -402,7 +420,7 @@ def convert(cgi_input, twobit_ref, twobit_name, var_only=False):
         cgi_input = auto_zip_open(cgi_input, 'rb')
 
     # Set up TwoBitFile for retrieving reference sequences.
-    reference = twobitreader.TwoBitFile(twobit_ref)
+    reference = TwoBitFile(twobit_ref)
 
     # Output header.
     header = make_header(twobit_name).split('\n')
@@ -411,12 +429,14 @@ def convert(cgi_input, twobit_ref, twobit_name, var_only=False):
 
     while True:
         line = cgi_input.readline()
+
         if not line:
             break
+
         line = line.decode('utf-8')
 
         # Skip header lines.
-        if re.search(r'^\W*$', line) or line.startswith('#'):
+        if line.startswith('#') or re.search(r'^\W*$', line):
             continue
 
         # Store header row labels.
@@ -426,7 +446,7 @@ def convert(cgi_input, twobit_ref, twobit_name, var_only=False):
             continue
 
         # If we reach this point, this is a line that contains data.
-        data = line.rstrip('\n').split("\t")
+        data = line.rstrip('\n').split('\t')
 
         out = process_next_position(
             data=data, cgi_input=cgi_input, header=header, reference=reference,
@@ -438,24 +458,29 @@ def convert(cgi_input, twobit_ref, twobit_name, var_only=False):
                 yield line
 
 
+# @profile
 def convert_to_file(cgi_input, output_file, twobit_ref, twobit_name, var_only=False):
     """Convert a CGI var file and output VCF-formatted data to file"""
 
     if isinstance(output_file, str):
         output_file = auto_zip_open(output_file, 'w')
 
-    conversion = convert(cgi_input=cgi_input, twobit_ref=twobit_ref, twobit_name=twobit_name, var_only=var_only)
+    conversion = convert(cgi_input=cgi_input, twobit_ref=twobit_ref,
+                         twobit_name=twobit_name, var_only=var_only)
+
     for line in conversion:
-        output_file.write(line + "\n")
+        output_file.write(line + '\n')
+
     output_file.close()
 
 
+# @profile
 def get_reference_genome_file(refseqdir, build):
     """
     Convenience fxn to get reference genome from target dir, download if needed
     """
     if not os.path.exists(refseqdir) or not os.path.isdir(refseqdir):
-        raise ValueError("No directory at {}".format(refseqdir))
+        raise ValueError('No directory at {}'.format(refseqdir))
     twobit_name = ''
     if build in ['b37', 'build 37', 'build37', '37', 'hg19']:
         twobit_name = 'hg19.2bit'
@@ -468,6 +493,7 @@ def get_reference_genome_file(refseqdir, build):
     return twobit_path, twobit_name
 
 
+# @profile
 def from_command_line():
     """
     Run CGI var to gVCF conversion from the command line.
@@ -499,11 +525,13 @@ def from_command_line():
     # Get local twobit file from its directory. Download and store if needed.
     twobit_path, twobit_name = get_reference_genome_file(
         args.refseqdir, build='b37')
+
     # Handle input
     if sys.stdin.isatty():  # false if data is piped in
         var_input = args.cgivarfile
     else:
         var_input = sys.stdin
+
     # Handle output
     if args.vcfoutfile:
         convert_to_file(var_input,
@@ -517,7 +545,7 @@ def from_command_line():
                 twobit_ref=twobit_path,
                 twobit_name=twobit_name,
                 var_only=args.varonly):
-            print(line)
+            print line
 
 
 if __name__ == '__main__':

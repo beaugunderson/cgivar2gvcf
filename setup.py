@@ -5,7 +5,7 @@ here = path.abspath(path.dirname(__file__))
 
 setup(
     name='cgivar2gvcf',
-    version='0.1.6',
+    version='0.2.0',
     description='Conversion of Complete Genomics var file to gVCF',
     url='https://github.com/madprime/cgivar2gvcf',
     author='Madeleine Ball',
@@ -20,6 +20,6 @@ setup(
     package_data={'': ['LICENSE.TXT', 'requirements.txt']},
 
     # Core dependencies should be listed here (will be installed by pip).
-    install_requires=['twobitreader==3.1.0'],
+    install_requires=['twobitreader==3.1.4'],
 
 )
